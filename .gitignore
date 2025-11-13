@@ -165,3 +165,4 @@ checkpoints/
 training_history_*.csv
 training_history_*.png
 *_plot.png
+*.pth
