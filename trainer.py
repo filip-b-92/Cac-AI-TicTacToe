@@ -5,9 +5,19 @@ from torch.optim.lr_scheduler import StepLR
 import numpy as np
 import random
 import os
+import csv
+from datetime import datetime
 from game import TicTacToe
 from memory import ReplayMemory
 from model import DQN
+
+# Try to import TensorBoard, but make it optional
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+    print("TensorBoard not available. Install with: pip install tensorboard")
 
 class Trainer:
     def __init__(self, device, policy_net=None):
@@ -51,6 +61,18 @@ class Trainer:
         self.loss_count = 0
         self.best_win_rate = 0.0
 
+        # Added: TensorBoard writer
+        self.use_tensorboard = TENSORBOARD_AVAILABLE and os.getenv('DISABLE_TENSORBOARD', '0') != '1'
+        if self.use_tensorboard:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.writer = SummaryWriter(f'runs/tictactoe_{timestamp}')
+            print(f"TensorBoard logging enabled. Run: tensorboard --logdir=runs")
+        else:
+            self.writer = None
+
+        # Added: Training history for CSV export
+        self.training_history = []
+
     def optimize_model(self):
         # Fixed: use min_memory_size instead of batch_size for initial check
         if len(self.memory) < self.min_memory_size:
@@ -91,6 +113,70 @@ class Trainer:
 
         # Added: Return loss value for tracking
         return loss.item()
+
+    def evaluate_against_random(self, num_games=100):
+        """Evaluate the policy network against a random player"""
+        self.policy_net.eval()
+        wins = 0
+        losses = 0
+        draws = 0
+
+        for _ in range(num_games):
+            game = TicTacToe()
+            state = torch.FloatTensor(game.reset()).to(self.device)
+            done = False
+
+            while not done:
+                # AI's turn (using policy network)
+                with torch.no_grad():
+                    q_values = self.policy_net(state)
+                    masked_q_values = q_values.clone()
+                    for i in range(9):
+                        if i not in game.available_actions():
+                            masked_q_values[i] = -float('inf')
+                    action = torch.argmax(masked_q_values).item()
+
+                next_state_np, reward, done = game.step(action, 1)
+                state = torch.FloatTensor(next_state_np).to(self.device)
+
+                if done:
+                    if reward == 1:
+                        wins += 1
+                    else:
+                        draws += 1
+                    break
+
+                # Random opponent's turn
+                random_action = random.choice(game.available_actions())
+                next_state_np, opponent_reward, done = game.step(random_action, -1)
+                state = torch.FloatTensor(next_state_np).to(self.device)
+
+                if done:
+                    if opponent_reward != 0:
+                        losses += 1
+                    else:
+                        draws += 1
+
+        self.policy_net.train()
+        return wins, losses, draws
+
+    def save_checkpoint(self, episode, checkpoint_dir='checkpoints'):
+        """Save a training checkpoint"""
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint = {
+            'episode': episode,
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'target_net_state_dict': self.target_net.state_dict(),
+            'opponent_net_state_dict': self.opponent_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'steps_done': self.steps_done,
+            'best_win_rate': self.best_win_rate,
+        }
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_episode_{episode}.pth')
+        torch.save(checkpoint, checkpoint_path)
+        print(f"  → Checkpoint saved: {checkpoint_path}")
+        return checkpoint_path
 
     def train(self):
         print(f"Starting training for {self.num_episodes} episodes...")
@@ -196,16 +282,60 @@ class Trainer:
                 draw_rate = (self.draws / games_played * 100) if games_played > 0 else 0
                 avg_loss = (self.total_loss / self.loss_count) if self.loss_count > 0 else 0
 
+                # Added: Evaluate against random player every 500 episodes for absolute performance
+                if (episode + 1) % 500 == 0:
+                    eval_wins, eval_losses, eval_draws = self.evaluate_against_random(num_games=100)
+                    eval_win_rate = eval_wins / 100 * 100
+                    print(f"\n=== Evaluation vs Random Player (100 games) ===")
+                    print(f"Wins: {eval_wins} | Losses: {eval_losses} | Draws: {eval_draws} | Win Rate: {eval_win_rate:.1f}%")
+                    print(f"===============================================\n")
+
+                    # Log evaluation metrics to TensorBoard
+                    if self.writer:
+                        self.writer.add_scalar('Evaluation/WinRate_vs_Random', eval_win_rate, episode + 1)
+                        self.writer.add_scalar('Evaluation/Wins_vs_Random', eval_wins, episode + 1)
+                        self.writer.add_scalar('Evaluation/Losses_vs_Random', eval_losses, episode + 1)
+                        self.writer.add_scalar('Evaluation/Draws_vs_Random', eval_draws, episode + 1)
+                else:
+                    eval_win_rate = None
+
                 print(f"Episode {episode + 1}/{self.num_episodes} | "
                       f"Win: {win_rate:.1f}% | Loss: {loss_rate:.1f}% | Draw: {draw_rate:.1f}% | "
                       f"Avg Loss: {avg_loss:.4f} | Epsilon: {epsilon:.3f} | "
                       f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+
+                # Added: Log to TensorBoard
+                if self.writer:
+                    self.writer.add_scalar('Training/WinRate', win_rate, episode + 1)
+                    self.writer.add_scalar('Training/LossRate', loss_rate, episode + 1)
+                    self.writer.add_scalar('Training/DrawRate', draw_rate, episode + 1)
+                    self.writer.add_scalar('Training/AvgLoss', avg_loss, episode + 1)
+                    self.writer.add_scalar('Training/Epsilon', epsilon, episode + 1)
+                    self.writer.add_scalar('Training/LearningRate', self.optimizer.param_groups[0]['lr'], episode + 1)
+                    self.writer.add_scalar('Training/MemorySize', len(self.memory), episode + 1)
+
+                # Added: Save training history
+                history_entry = {
+                    'episode': episode + 1,
+                    'win_rate': win_rate,
+                    'loss_rate': loss_rate,
+                    'draw_rate': draw_rate,
+                    'avg_loss': avg_loss,
+                    'epsilon': epsilon,
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'eval_win_rate': eval_win_rate if eval_win_rate is not None else -1
+                }
+                self.training_history.append(history_entry)
 
                 # Added: Save best model based on win rate
                 if win_rate > self.best_win_rate:
                     self.best_win_rate = win_rate
                     torch.save(self.policy_net.state_dict(), 'tic_tac_toe_best_model.pth')
                     print(f"  → New best model saved! Win rate: {win_rate:.1f}%")
+
+                # Added: Save checkpoint every 5000 episodes
+                if (episode + 1) % 5000 == 0:
+                    self.save_checkpoint(episode + 1)
 
                 # Reset metrics for next 100 episodes
                 self.wins = 0
@@ -216,6 +346,25 @@ class Trainer:
 
         # Save the final trained model
         torch.save(self.policy_net.state_dict(), 'tic_tac_toe_model.pth')
+
+        # Save final checkpoint
+        self.save_checkpoint(self.num_episodes)
+
+        # Added: Export training history to CSV
+        if self.training_history:
+            csv_filename = f'training_history_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            with open(csv_filename, 'w', newline='') as csvfile:
+                fieldnames = ['episode', 'win_rate', 'loss_rate', 'draw_rate', 'avg_loss',
+                             'epsilon', 'learning_rate', 'eval_win_rate']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.training_history)
+            print(f"Training history saved to: {csv_filename}")
+
+        # Close TensorBoard writer
+        if self.writer:
+            self.writer.close()
+
         print("\nTraining complete!")
         print(f"Final model saved as 'tic_tac_toe_model.pth'")
         print(f"Best model saved as 'tic_tac_toe_best_model.pth' (win rate: {self.best_win_rate:.1f}%)")
